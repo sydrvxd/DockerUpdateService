@@ -4,10 +4,7 @@ namespace DockerUpdateService.Options;
 
 public sealed record UpdateSettings
 {
-    public const string Section = "Update";
-
-    [Required]
-    public required PortainerOptions Portainer { get; init; }
+    public const string Section = "Update"; public PortainerOptions? Portainer { get; init; } = new();
 
     public string[] ExcludeImages { get; init; } = [];
 
@@ -19,3 +16,4 @@ public sealed record UpdateSettings
         public string? ApiKey { get; init; }
     }
 }
+

@@ -1,6 +1,7 @@
 using Docker.DotNet;
 using DockerUpdateService.Options;
 using DockerUpdateService.Services;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
@@ -29,15 +30,24 @@ Host.CreateDefaultBuilder(args)
         });
 
         // ---------- Portainer HTTP client -------------------------------------
-        services.AddHttpClient<IPortainerClient, PortainerClient>()
-        .ConfigureHttpClient((sp, http) =>
+
+        // Conditionally register Portainer integration
+        var updCfg = ctx.Configuration.GetSection(UpdateSettings.Section).Get<UpdateSettings>();
+        if (!string.IsNullOrWhiteSpace(updCfg?.Portainer?.Url) &&
+            !string.IsNullOrWhiteSpace(updCfg.Portainer.ApiKey))
         {
-            var cfg = sp.GetRequiredService<IOptions<UpdateSettings>>().Value.Portainer;
-            if (string.IsNullOrWhiteSpace(cfg?.Url) || string.IsNullOrWhiteSpace(cfg.ApiKey))
-                throw new InvalidOperationException("Portainer disabled: Url or ApiKey missing");
-            http.BaseAddress = new Uri(cfg.Url);
-            http.DefaultRequestHeaders.Add("X-API-Key", cfg.ApiKey);
-        });
+            services.AddHttpClient<IPortainerClient, PortainerClient>()
+                    .ConfigureHttpClient((sp, http) =>
+                    {
+                        var cfg = sp.GetRequiredService<IOptions<UpdateSettings>>().Value.Portainer!;
+                        http.BaseAddress = new Uri(cfg.Url!);
+                        http.DefaultRequestHeaders.Add("X-API-Key", cfg.ApiKey!);
+                    });
+        }
+        else
+        {
+            services.AddSingleton<IPortainerClient, NullPortainerClient>();
+        }
 
         // ---------- Core services --------------------------------------------
         services.AddSingleton<IStackUpdater, StackUpdater>();

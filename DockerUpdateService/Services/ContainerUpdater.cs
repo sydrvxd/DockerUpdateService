@@ -18,7 +18,7 @@ internal sealed partial class ContainerUpdater(
     ILogger<ContainerUpdater> log,
     IDockerClient docker,
     IOptions<UpdateSettings> settings,
-    StackUpdater stackUpdater) // gives access to IgnoredContainers & StackImages
+    IStackUpdater stackUpdater)
     : IContainerUpdater
 {
     private readonly HashSet<string> _ignored = stackUpdater.IgnoredContainers;

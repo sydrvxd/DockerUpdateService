@@ -1,7 +1,4 @@
 // Services/StackUpdater.cs
-using System.Net.Http.Headers;
-using System.Text;
-using System.Text.Json;
 using Docker.DotNet;
 using Docker.DotNet.Models;
 using DockerUpdateService.Helpers;
@@ -9,6 +6,10 @@ using DockerUpdateService.Models;
 using DockerUpdateService.Options;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using System.Net.Http.Headers;
+using System.Text;
+using System.Text.Json;
+using System.Text.RegularExpressions;
 
 namespace DockerUpdateService.Services;
 
@@ -18,7 +19,7 @@ namespace DockerUpdateService.Services;
 /// containers of that stack to <see cref="IgnoredContainers"/> so the per‑container
 /// updater skips them.  Behaviour matches the original DockerUpdateService.
 /// </summary>
-internal sealed class StackUpdater(
+internal sealed partial class StackUpdater(
     ILogger<StackUpdater> log,
     IDockerClient docker,
     IPortainerClient portainer,
@@ -29,16 +30,16 @@ internal sealed class StackUpdater(
     private readonly JsonSerializerOptions _json = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
 
     /// <summary>Repos found in compose files of all processed stacks.</summary>
-    internal HashSet<string> StackImages { get; } = [];
+    public HashSet<string> StackImages { get; } = [];
 
     /// <summary>Containers that belong to Portainer stacks we redeployed (skip in single‑container updater).</summary>
-    internal HashSet<string> IgnoredContainers { get; } = [];
+    public HashSet<string> IgnoredContainers { get; } = [];
 
     // ---------------------------------------------------------------------
 
     public async Task UpdateStacksAsync(CancellationToken ct = default)
     {
-        if (portainer is null || string.IsNullOrWhiteSpace(_settings.Portainer.Url))
+        if (portainer is null || string.IsNullOrWhiteSpace(_settings.Portainer?.Url))
         {
             log.LogDebug("Portainer integration disabled – skipping stack check.");
             return;
@@ -52,14 +53,27 @@ internal sealed class StackUpdater(
             log.LogInformation("Checking stack {Name} (ID {Id}) …", stack.Name, stack.Id);
 
             // 1) Download compose file ---------------------------------------------------
-            string yaml = await portainer.GetStackFileAsync(stack.Id, ct);
+            string yaml;
+            try
+            {
+                yaml = await portainer.GetStackFileAsync(stack.Id, ct);
+                log.LogInformation("  Stack file:\n{Yaml}", yaml);
+            }
+            catch (StackFileNotFoundException)
+            {
+                log.LogWarning("Stack {Id} does not expose its file – created via UI? Skipping.", stack.Id);
+                continue;
+            }
 
             // 2) Parse image references --------------------------------------------------
             var images = ParseImagesFromYaml(yaml);
 
+            log.LogInformation("  Found {Count} images in Stack Yaml.", images.Count);
+
             bool updateNeeded = false;
             foreach (string img in images)
             {
+                log.LogInformation("  Found image {img} in Stack Yaml.", img);
                 (string repo, _) = ImageNameHelper.Split(img);
                 StackImages.Add(repo);
 
@@ -93,11 +107,39 @@ internal sealed class StackUpdater(
     //                         Helper methods
     // ---------------------------------------------------------------------
 
-    private static List<string> ParseImagesFromYaml(string yaml) =>
-        [.. yaml.Split('\n', StringSplitOptions.RemoveEmptyEntries)
-            .Select(l => l.Trim())
-            .Where(l => l.StartsWith("image:", StringComparison.OrdinalIgnoreCase))
-            .Select(l => l["image:".Length..].Trim())];
+    private static List<string> ParseImagesFromYaml(string payload)
+    {
+        // 1) Unwrap JSON if needed -------------------------------------------------
+        string yaml = payload.TrimStart() switch
+        {
+            // Quick heuristic: JSON payload starts with “{” and contains the key once
+            var s when s.StartsWith('{') && s.Contains("\"StackFileContent\"", StringComparison.Ordinal) =>
+                JsonDocument.Parse(s).RootElement
+                            .GetProperty("StackFileContent")
+                            .GetString() ?? string.Empty,
+
+            // Otherwise assume we already got raw YAML
+            _ => payload
+        };
+
+        // 2) Scan for image lines --------------------------------------------------
+        // Works even when indentation or casing differs ( “image:”, “IMAGE :” … )
+        var images = new List<string>();
+        foreach (var line in yaml.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var trimmed = line.Trim();
+
+            if (trimmed.StartsWith("image", StringComparison.OrdinalIgnoreCase))
+            {
+                // allow “image:name:tag” and “image : name:tag”
+                var match = ImageRegex().Match(trimmed);
+                if (match.Success)
+                    images.Add(match.Groups[1].Value.Trim());
+            }
+        }
+
+        return images;
+    }
 
     private static readonly HttpClient http = new();
 
@@ -109,8 +151,14 @@ internal sealed class StackUpdater(
         // split registry / repo / tag
         var (registry, repo, tag) = RegistryHelpers.SplitReference(reference);
 
-        string remoteDigest = await RegistryHelpers.GetRemoteDigestAsync(registry, repo, tag, http, ct);
-        if (string.IsNullOrEmpty(remoteDigest)) return false;        // could not fetch
+        log.LogInformation("Checking Stack Image: {registry}/{repo}:{tag}", registry, repo, tag);
+
+        string remoteDigest = await RegistryHelpers.GetRemoteDigestAsync(reference, http, ct); // await RegistryHelpers.GetRemoteDigestAsync(registry, repo, tag, http, ct);
+        if (string.IsNullOrEmpty(remoteDigest))
+        {
+            log.LogWarning("  Could not fetch remote digest for {reference}", reference);
+            return false;        // could not fetch
+        }
 
         // local digest
         var img = await docker.Images.InspectImageAsync($"{repo}:{tag}", ct);
@@ -148,8 +196,9 @@ internal sealed class StackUpdater(
         try
         {
             var res = await portainer.GetStackFileAsync(id, ct); // detail endpoint replaced by GetStackFile
+            var env = JsonSerializer.Deserialize<StackEnv[]>(res, _json) ?? [];
             // If you need the Env array exactly as before, call the detail endpoint via HttpClient here.
-            return []; // keeping env unchanged; extend if needed
+            return env; // keeping env unchanged; extend if needed
         }
         catch
         {
@@ -178,4 +227,7 @@ internal sealed class StackUpdater(
                 log.LogDebug("    Ignoring container {Container}", cname);
         }
     }
+
+    [GeneratedRegex(@"^image\s*:?\s*(.+)$", RegexOptions.IgnoreCase)]
+    private static partial Regex ImageRegex();
 }

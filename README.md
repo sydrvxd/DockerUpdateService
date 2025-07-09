@@ -1,223 +1,184 @@
+
 # DockerUpdateService
 
-**DockerUpdateService** is a C# (.NET 8) service designed to automatically monitor and update your running Docker containers when a newer image is available. It supports backup creation, automatic rollback on failure, flexible scheduling (interval, daily, weekly, or monthly), and an exclude list to prevent certain containers from being updated.
+**DockerUpdateService** is a lightweight, container‑friendly daemon written in **C# 12 / .NET 8** that automatically keeps your self‑hosted Docker workloads up‑to‑date.
+
+It works in two complementary modes:
+
+| Mode | What it does | Typical use‑case |
+|------|--------------|------------------|
+| **Stack‑level** | • Pulls the images referenced in every Portainer stack.<br>• If any image was updated, triggers a *Portainer* **stack redeploy**.<br>• Adds the stack’s containers to an *ignore* list so they are **not** processed again by the container‑level logic. | When you manage services with **docker‑compose** files through *Portainer*. |
+| **Container‑level** | • Iterates over the remaining containers, pulls the tag they were started with, and if the image ID changed:<br>&nbsp;&nbsp;– Stops the running container.<br>&nbsp;&nbsp;– Creates a *backup tag* (`:rollback‑yyyyMMddHHmmss`).<br>&nbsp;&nbsp;– Starts a **fresh container** with the new image and the same configuration.<br>&nbsp;&nbsp;– Waits until the container reports a healthy state, otherwise **rolls back**. | Stand‑alone containers started with `docker run` / `docker create`. |
+
+Other goodies include:
+
+* **Pruning** of unused images **and** automatic deletion of old backup tags after the configurable retention period.
+* **Flexible scheduling** – run on a fixed interval *or* at a specific time daily / weekly / monthly.
+* **Minimal configuration** – a single `appsettings.json` (or environment variables / secrets).
+* First‑class **Portainer** integration (API key authentication).
 
 ---
 
-## Features
+## Quick start
 
-- **Automatic Updates:**  
-  Periodically scans your Docker containers, pulls the corresponding images, and checks if a newer version is available. If so, the service will stop, remove, and recreate the container using the updated image.
-
-- **Backups & Rollback:**  
-  Before updating a container, the service creates a backup tag of the old image. If the updated container fails to start or exits with an error within a configurable time frame, the service automatically rolls back to the backup image and excludes the container from future updates.
-
-- **Flexible Scheduling:**  
-  Configure the update frequency using environment variables. Choose between fixed intervals (e.g., every 10 minutes) or specific times:
-  - **INTERVAL:** Run every X minutes/hours (e.g., `10m`).
-  - **DAILY:** Run once a day at a specified time (e.g., `03:00`).
-  - **WEEKLY:** Run on a specific day at a specified time (e.g., every Sunday at `03:00`).
-  - **MONTHLY:** Run on a specific day of the month at a specified time (e.g., on the 1st at `03:00`).
-
-- **Exclude List:**  
-  Prevent specific containers from being updated by specifying their image names via an environment variable.
-
-- **Automatic Cleanup:**  
-  Automatically removes backup images that are older than 30 days.
-
----
-
-## Getting Started
-
-### Prerequisites
-
-- **Docker:**  
-  Ensure Docker is installed and running on your host.
-  
-- **.NET 8 SDK (optional):**  
-  If you want to build the service from source.
-
----
-
-## Installation
-
-### Building from Source
-
-1. **Clone the repository:**
-
-   ```bash
-   git clone https://github.com/yourusername/DockerUpdateService.git
-   cd DockerUpdateService
-   ```
-
-2. **Restore NuGet packages and build:**
-
-   ```bash
-   dotnet restore
-   dotnet publish -c Release -o publish
-   ```
-
-3. **Run locally:**
-
-   ```bash
-   dotnet run
-   ```
-
-### Using the Docker Image
-
-A pre-built Docker image is available on Docker Hub:
+### 1. Build the container image
 
 ```bash
-docker pull yourusername/dockerupdateservice:latest
+# in the repository root
+docker build -t docker-update-service .
 ```
 
----
+### 2. Provide configuration
 
-## Configuration
-
-### Environment Variables
-
-The service behavior can be customized via the following environment variables:
-
-- **EXCLUDE_IMAGES**  
-  Comma-separated list of container images that should **not** be monitored/updated.  
-  _Example:_  
-  ```bash
-  EXCLUDE_IMAGES="openhab/openhab, redis"
-  ```
-
-- **UPDATE_MODE**  
-  Determines the scheduling mode for update checks. Possible values:  
-  - `INTERVAL` – Runs at a fixed interval.  
-  - `DAILY` – Runs once per day at a specified time.  
-  - `WEEKLY` – Runs once per week on a specified day/time.  
-  - `MONTHLY` – Runs once per month on a specified day/time.  
-  _Default:_ `INTERVAL`
-
-- **UPDATE_INTERVAL**  
-  Used only if `UPDATE_MODE=INTERVAL`. Specifies the time span between checks.  
-  _Example:_  
-  ```bash
-  UPDATE_INTERVAL="10m"
-  ```
-  Valid formats include seconds (`s`), minutes (`m`), hours (`h`), or days (`d`).
-
-- **UPDATE_TIME**  
-  Used for `DAILY`, `WEEKLY`, or `MONTHLY` modes. Specifies the time (in `HH:mm` 24-hour format) at which the update should run.  
-  _Example:_  
-  ```bash
-  UPDATE_TIME="03:00"
-  ```
-
-- **UPDATE_DAY**  
-  Used for `WEEKLY` (e.g., `SUNDAY`) or `MONTHLY` (e.g., `1` for the 1st day of the month) modes.  
-  _Example:_  
-  ```bash
-  UPDATE_DAY="SUNDAY"
-  ```
-
-- **DOCKER_HOST**  
-  (Optional) Overrides the Docker API endpoint. Generally, this is not needed if you're mounting the Docker socket.
-
----
-
-## Docker Compose
-
-To run DockerUpdateService with Docker Compose, use a configuration similar to the following:
-
-### For Linux
+Create a volume‑mapped `appsettings.json` (see full schema below) or use environment variables:
 
 ```yaml
-version: '3.8'
-services:
-  docker-updater:
-    image: yourusername/dockerupdateservice:latest
-    container_name: docker-updater
-    user: "root"
-    privileged: true  # Use only if necessary
-    environment:
-      EXCLUDE_IMAGES: "openhab/openhab, redis"
-      UPDATE_MODE: "INTERVAL"         # or DAILY, WEEKLY, MONTHLY
-      UPDATE_INTERVAL: "10m"            # used with INTERVAL mode
-      # For DAILY/WEEKLY/MONTHLY:
-      # UPDATE_TIME: "03:00"
-      # UPDATE_DAY: "SUNDAY"            # for WEEKLY or "1" for MONTHLY
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    restart: unless-stopped
+volumes:
+  - ./appsettings.json:/app/appsettings.json:ro
 ```
 
-### For Windows
+### 3. Run
+
+```bash
+docker run   --name docker-update-service   -v /var/run/docker.sock:/var/run/docker.sock   -v ./appsettings.json:/app/appsettings.json:ro   --restart unless-stopped   docker-update-service
+```
+
+The container needs access to the **Docker socket** (or the Windows named pipe) to manage images and containers.
+
+---
+
+## Configuration reference (`appsettings.json`)
+
+```jsonc
+{
+  "Update": {
+    "Portainer": {
+      "Url": "https://portainer.example.com/api/",
+      "ApiKey": "<YOUR-API-KEY>"
+    },
+
+    // Images that must never be updated (substring match).
+    "ExcludeImages": [ "mongo:3", "mycorp/legacy" ],
+
+    // How long to keep backup tags (ISO 8601 or "d.hh:mm:ss").
+    "BackupRetention": "5.00:00:00"
+  },
+
+  "Schedule": {
+    // "Interval" | "Daily" | "Weekly" | "Monthly"
+    "Mode": "Daily",
+
+    // Only used in Interval mode (hh:mm:ss).
+    "Interval": "00:30:00",
+
+    // Run at 03:00 local time (Daily/Weekly/Monthly)
+    "TimeOfDay": "03:00:00",
+
+    // Run every Monday at 03:00 (Weekly)
+    "DayOfWeek": "Monday"
+  }
+}
+```
+
+All settings can also be supplied via environment variables using the `__` (double underscore) separator, e.g.:
+
+```bash
+# same as Update:Portainer:ApiKey in appsettings.json
+-e "Update__Portainer__ApiKey=XYZ..."
+```
+
+---
+
+## Building & running from source
+
+```bash
+dotnet build -c Release
+dotnet publish -c Release -o ./publish
+cd publish
+DOTNET_ENVIRONMENT=Production dotnet DockerUpdateService.dll
+```
+
+---
+
+## Internals & design notes
+
+* **BackgroundService** `UpdateWorker` coordinates one cycle: `Pruner ➜ StackUpdater ➜ ContainerUpdater`.
+* The Docker API is accessed through [**Docker.DotNet**](https://github.com/christopherrej/Docker.DotNet).  
+  The client automatically connects to `unix:///var/run/docker.sock` on Linux and `npipe://./pipe/docker_engine` on Windows.
+* Portainer interaction is encapsulated in `PortainerClient` and only enabled when both **Url** *and* **ApiKey** are provided.
+* All I/O is **asynchronous**; the service is entirely CPU‑bound when parsing YAML and computing diffs.
+* The implementation is **nullable‑aware** and leverages new C# 12 features such as *primary constructors* and *collection expressions* for succinctness.
+
+---
+
+## License
+
+Licensed under the MIT license. See `LICENSE.txt` for details.
+
+
+### Portainer integration (optional)
+
+If you want the service to redeploy **Portainer stacks**, add a `Portainer` block
+inside the `Update` section **or** export the corresponding environment variables.
+
+```jsonc
+{
+  "Update": {
+    "Portainer": {
+      "Url": "https://portainer.yourdomain.example",
+      "ApiKey": "<PORTAINER_API_KEY>"
+    }
+  }
+}
+```
+
+| Environment variable | Matches config key |
+|----------------------|--------------------|
+| `UPDATE__PORTAINER__URL` | `Update:Portainer:Url` |
+| `UPDATE__PORTAINER__APIKEY` | `Update:Portainer:ApiKey` |
+
+**Leave the keys empty or omit the block entirely to disable Portainer support.**
+
+## Configuration via environment variables
+
+Every configuration key can be supplied through **environment variables** &mdash; ideal when running inside Docker or Kubernetes.  
+The rule is simple: replace each `:` level separator with a double underscore `__`.
+
+| Section & Key | Example value | Environment variable |
+|---------------|---------------|----------------------|
+| `Update:ExcludeImages:0` | `hello/world` | `UPDATE__EXCLUDEIMAGES__0` |
+| `Update:ExcludeImages:1` | `busybox:latest` | `UPDATE__EXCLUDEIMAGES__1` |
+| `Update:BackupRetention` | `2.00:00:00` (2 days) | `UPDATE__BACKUPRETENTION` |
+| `Update:Portainer:Url` | `https://portainer.mycorp.local` | `UPDATE__PORTAINER__URL` |
+| `Update:Portainer:ApiKey` | `<your api key>` | `UPDATE__PORTAINER__APIKEY` |
+| `Schedule:Mode` | `Weekly` | `SCHEDULE__MODE` |
+| `Schedule:Interval` | `00:30:00` | `SCHEDULE__INTERVAL` |
+| `Schedule:TimeOfDay` | `03:00` | `SCHEDULE__TIMEOFDAY` |
+| `Schedule:DayOfWeek` | `Sunday` | `SCHEDULE__DAYOFWEEK` |
+
+### Quick example (docker-compose)
 
 ```yaml
-version: '3.8'
 services:
-  docker-updater:
-    image: yourusername/dockerupdateservice:latest
-    container_name: docker-updater
-    user: "root"
-    privileged: true  # Use only if necessary
+  updater:
+    image: docker-update-service:latest
     environment:
-      EXCLUDE_IMAGES: "openhab/openhab, redis"
-      UPDATE_MODE: "INTERVAL"
-      UPDATE_INTERVAL: "10m"
-      # For DAILY/WEEKLY/MONTHLY:
-      # UPDATE_TIME: "03:00"
-      # UPDATE_DAY: "SUNDAY"
-    volumes:
-      - \\.\pipe\docker_engine:\\.\pipe\docker_engine
-    restart: unless-stopped
+      # run every Sunday at 03:00
+      SCHEDULE__MODE: Weekly
+      SCHEDULE__TIMEOFDAY: "03:00"
+      SCHEDULE__DAYOFWEEK: Sunday
+
+      # keep old images for 5 days
+      UPDATE__BACKUPRETENTION: 5.00:00:00
+
+      # ignore these images completely
+      UPDATE__EXCLUDEIMAGES__0: "library/nginx:alpine"
+      UPDATE__EXCLUDEIMAGES__1: "some/other-image"
+
+      # enable Portainer stack re‑deploy
+      UPDATE__PORTAINER__URL: https://portainer.mycorp.local/api
+      UPDATE__PORTAINER__APIKEY: "${PORTAINER_API_KEY}"
 ```
 
----
-
-## Dockerfile Compatibility
-
-The Dockerfile is designed to be compatible with both Linux and Windows containers by using a build argument to select the base image:
-
-```dockerfile
-# syntax=docker/dockerfile:1
-ARG BASE_IMAGE=mcr.microsoft.com/dotnet/runtime:8.0
-FROM ${BASE_IMAGE} AS base
-WORKDIR /app
-COPY publish/ .
-ENTRYPOINT ["DockerUpdateService"]
-```
-
-To build for Linux:
-
-```bash
-docker build -t dockerupdateservice:linux .
-```
-
-To build for Windows:
-
-```bash
-docker build --build-arg BASE_IMAGE=mcr.microsoft.com/dotnet/runtime:8.0-nanoserver -t dockerupdateservice:windows .
-```
-
----
-
-## Logging & Troubleshooting
-
-- **Logs:**  
-  View logs with:
-  ```bash
-  docker logs -f docker-updater
-  ```
-
-- **Common Issues:**  
-  - **Connection failed / Permission denied:**  
-    Ensure the Docker socket (or named pipe) is correctly mounted and that the container is running as root or has proper permissions.
-  - **Update or rollback failures:**  
-    Review logs for detailed error messages and adjust configuration or scheduling parameters if necessary.
-
----
-
-## Contributing
-
-Contributions, bug fixes, and improvements are welcome! Please open an issue or submit a pull request.
-
----
-
-*Happy Updating!*
+> **Tip:** ASP.NET’s configuration binder is case‑insensitive, so
+> `schedule__mode`, `Schedule__Mode`, or `SCHEDULE__MODE` all work the same.
