@@ -1,3 +1,4 @@
+// Models/Stack.cs
 using System.Text.Json.Serialization;
 
 namespace DockerUpdateService.Models;

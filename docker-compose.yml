@@ -1,0 +1,22 @@
+version: "3.8"
+services:
+  docker-update-service:
+    build: .
+    container_name: docker-update-service
+    restart: unless-stopped
+    environment:
+      # Scheduling (pick one mode)
+      - UPDATE_MODE=DAILY        # INTERVAL | DAILY | WEEKLY | MONTHLY
+      - UPDATE_INTERVAL=10m      # only used in INTERVAL mode
+      - UPDATE_TIME=03:00        # HH:mm for DAILY/WEEKLY/MONTHLY
+      - UPDATE_DAY=Monday        # DayOfWeek for WEEKLY or 1..28 for MONTHLY
+      # Filters
+      - EXCLUDE_IMAGES=library/postgres,ghcr.io/org/critical-app
+      # Portainer (optional)
+      - PORTAINER_URL=https://portainer.local:9443
+      - PORTAINER_API_KEY=YOUR_API_KEY
+      - PORTAINER_INSECURE=true  # set to false if Portainer has a valid cert
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    # If you run Docker Desktop on Windows, map the named pipe instead of the unix socket:
+    # - //./pipe/docker_engine://./pipe/docker_engine

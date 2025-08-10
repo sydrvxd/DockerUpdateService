@@ -1,60 +1,75 @@
+// Program.cs
 using Docker.DotNet;
 using DockerUpdateService.Options;
 using DockerUpdateService.Services;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Options;
-using System.Runtime.InteropServices;
+using Microsoft.Extensions.Logging;
 
-Host.CreateDefaultBuilder(args)
-    .ConfigureServices((ctx, services) =>
+var builder = Host.CreateApplicationBuilder(args);
+
+// Logging (simple console, timestamps)
+builder.Logging.ClearProviders();
+builder.Logging.AddSimpleConsole(o =>
+{
+    o.TimestampFormat = "yyyy-MM-dd HH:mm:ss ";
+    o.SingleLine = true;
+});
+
+// Options from environment variables
+builder.Services.AddSingleton(UpdateOptions.LoadFromEnvironment());
+builder.Services.AddSingleton(PortainerOptions.LoadFromEnvironment());
+
+// Docker client
+builder.Services.AddSingleton<IDockerClient>(sp =>
+{
+    var logger = sp.GetRequiredService<ILoggerFactory>().CreateLogger("DockerClient");
+    var dockerHost = Environment.GetEnvironmentVariable("DOCKER_HOST");
+
+    string? uri = dockerHost switch
     {
-        // ---------- Options ---------------------------------------------------
-        services.AddOptions<UpdateSettings>()
-                .Bind(ctx.Configuration.GetSection(UpdateSettings.Section))
-                .ValidateDataAnnotations()   
-                .ValidateOnStart();          
-
-        services.AddOptions<SchedulingSettings>()
-                .Bind(ctx.Configuration.GetSection(SchedulingSettings.Section))
-                .ValidateOnStart();
-
-        // ---------- Docker ----------------------------------------------------
-        services.AddSingleton<IDockerClient>(_ =>
-        {
-            var uri = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+        not null and not "" => dockerHost,
+        _ => OperatingSystem.IsWindows()
                 ? "npipe://./pipe/docker_engine"
-                : "unix:///var/run/docker.sock";
-            return new DockerClientConfiguration(new Uri(uri)).CreateClient();
-        });
+                : (File.Exists("/var/run/docker.sock") ? "unix:///var/run/docker.sock" : null)
+    };
 
-        // ---------- Portainer HTTP client -------------------------------------
+    if (uri is null)
+        throw new InvalidOperationException("Could not locate Docker engine. Mount /var/run/docker.sock or set DOCKER_HOST.");
 
-        // Conditionally register Portainer integration
-        var updCfg = ctx.Configuration.GetSection(UpdateSettings.Section).Get<UpdateSettings>();
-        if (!string.IsNullOrWhiteSpace(updCfg?.Portainer?.Url) &&
-            !string.IsNullOrWhiteSpace(updCfg.Portainer.ApiKey))
+    logger.LogInformation("Connecting to Docker: {Uri}", uri);
+    return new DockerClientConfiguration(new Uri(uri)).CreateClient();
+});
+
+// HttpClient for Portainer
+builder.Services.AddHttpClient<PortainerService>()
+    .ConfigureHttpClient((sp, client) =>
+    {
+        var opt = sp.GetRequiredService<PortainerOptions>();
+        if (!string.IsNullOrWhiteSpace(opt.Url))
         {
-            services.AddHttpClient<IPortainerClient, PortainerClient>()
-                    .ConfigureHttpClient((sp, http) =>
-                    {
-                        var cfg = sp.GetRequiredService<IOptions<UpdateSettings>>().Value.Portainer!;
-                        http.BaseAddress = new Uri(cfg.Url!);
-                        http.DefaultRequestHeaders.Add("X-API-Key", cfg.ApiKey!);
-                    });
+            client.BaseAddress = new Uri(opt.Url!);
         }
-        else
+        if (!string.IsNullOrWhiteSpace(opt.ApiKey))
         {
-            services.AddSingleton<IPortainerClient, NullPortainerClient>();
+            client.DefaultRequestHeaders.TryAddWithoutValidation("X-API-Key", opt.ApiKey);
         }
-
-        // ---------- Core services --------------------------------------------
-        services.AddSingleton<IStackUpdater, StackUpdater>();
-        services.AddSingleton<IContainerUpdater, ContainerUpdater>();
-        services.AddSingleton<IPruner, Pruner>();
-
-        services.AddHostedService<UpdateWorker>();
     })
-    .Build()
-    .Run();
+    .ConfigurePrimaryHttpMessageHandler(sp =>
+    {
+        var opt = sp.GetRequiredService<PortainerOptions>();
+        return new HttpClientHandler
+        {
+            ServerCertificateCustomValidationCallback =
+                opt.InsecureTls ? HttpClientHandler.DangerousAcceptAnyServerCertificateValidator : null
+        };
+    });
+
+// Core services
+builder.Services.AddSingleton<DockerEngineService>();
+builder.Services.AddSingleton<PortainerService>();
+builder.Services.AddHostedService<DockerUpdateWorker>();
+
+var app = builder.Build();
+
+await app.RunAsync();
