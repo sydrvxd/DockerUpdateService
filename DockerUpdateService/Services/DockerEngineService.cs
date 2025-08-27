@@ -20,7 +20,7 @@ public sealed class DockerEngineService
         _log = log;
     }
 
-    public (string repo, string tag) SplitImage(string reference)
+    public static (string repo, string tag) SplitImage(string reference)
     {
         var match = Patterns.ImageRegex().Match(reference);
         if (match.Success)

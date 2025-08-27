@@ -31,6 +31,9 @@ public sealed class PortainerService(
 
         if (!Enabled) return (stackImages, newlyIgnored);
 
+        if (_http.BaseAddress is null && !string.IsNullOrWhiteSpace(_opts.Url))
+            _http.BaseAddress = new Uri(_opts.Url!);
+
         _log.LogInformation("Querying Portainer stacks …");
         var listResp = await _http.GetAsync("/api/stacks", ct);
         if (!listResp.IsSuccessStatusCode)
@@ -56,7 +59,7 @@ public sealed class PortainerService(
             var updateNeeded = false;
             foreach (var img in images)
             {
-                var (repo, tag) = _engine.SplitImage(img);
+                var (repo, tag) = DockerEngineService.SplitImage(img);
                 stackImages.Add($"{repo}");
                 if (await _engine.ImageHasNewVersion(img))
                 {
@@ -134,9 +137,9 @@ public sealed class PortainerService(
     private sealed record StackEnv(string Name, string? Value);
     private sealed record StackFileResponse(string StackFileContent);
     private sealed record PortainerStackWithFile(
-    int Id,
-    string Name,
-    int EndpointId,
-    string StackFileContent,
-    StackEnv[]? Env);
+        int Id,
+        string Name,
+        int EndpointId,
+        string StackFileContent,
+        StackEnv[]? Env);
 }

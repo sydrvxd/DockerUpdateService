@@ -6,27 +6,22 @@ using Microsoft.Extensions.Logging;
 
 namespace DockerUpdateService.Services;
 
-public sealed class DockerUpdateWorker : BackgroundService
+public sealed class DockerUpdateWorker(
+    UpdateOptions update, 
+    PortainerOptions portainer, 
+    DockerEngineService docker, 
+    PortainerService port, 
+    ILogger<DockerUpdateWorker> log) : BackgroundService
 {
-    private readonly UpdateOptions _update;
-    private readonly PortainerOptions _portainer;
-    private readonly DockerEngineService _docker;
-    private readonly PortainerService _port;
-    private readonly ILogger<DockerUpdateWorker> _log;
+    private readonly UpdateOptions _update = update;
+    private readonly PortainerOptions _portainer = portainer;
+    private readonly DockerEngineService _docker = docker;
+    private readonly PortainerService _port = port;
+    private readonly ILogger<DockerUpdateWorker> _log = log;
 
     private readonly HashSet<string> _ignoredContainers = new(StringComparer.OrdinalIgnoreCase);
-    private readonly List<string> _stackImages = new();
-    private readonly HashSet<string> _excludeImages;
-
-    public DockerUpdateWorker(UpdateOptions update, PortainerOptions portainer, DockerEngineService docker, PortainerService port, ILogger<DockerUpdateWorker> log)
-    {
-        _update = update;
-        _portainer = portainer;
-        _docker = docker;
-        _port = port;
-        _log = log;
-        _excludeImages = update.ExcludeImages;
-    }
+    private readonly List<string> _stackImages = [];
+    private readonly HashSet<string> _excludeImages = update.ExcludeImages;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {

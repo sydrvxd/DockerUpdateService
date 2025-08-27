@@ -67,7 +67,6 @@ builder.Services.AddHttpClient<PortainerService>()
 
 // Core services
 builder.Services.AddSingleton<DockerEngineService>();
-builder.Services.AddSingleton<PortainerService>();
 builder.Services.AddHostedService<DockerUpdateWorker>();
 
 var app = builder.Build();
