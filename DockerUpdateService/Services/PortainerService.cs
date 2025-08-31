@@ -192,17 +192,17 @@ public sealed class PortainerService(
             _log.LogInformation("  Stack redeployed successfully.");
 
             // Ignore compose project containers in the single-container pass
-            var related = await _docker.Containers.ListContainersAsync(new ContainersListParameters
-            {
-                All = true,
-                Filters = new Dictionary<string, IDictionary<string, bool>>
-                {
-                    ["label"] = new Dictionary<string, bool>
-                    {
-                        [$"com.docker.compose.project={stack.Name}"] = true
-                    }
-                }
-            }, ct);
+            //var related = await _docker.Containers.ListContainersAsync(new ContainersListParameters
+            //{
+            //    All = true,
+            //    Filters = new Dictionary<string, IDictionary<string, bool>>
+            //    {
+            //        ["label"] = new Dictionary<string, bool>
+            //        {
+            //            [$"com.docker.compose.project={stack.Name}"] = true
+            //        }
+            //    }
+            //}, ct);
 
             foreach (var ctr in related)
             {
