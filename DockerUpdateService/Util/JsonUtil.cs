@@ -1,4 +1,3 @@
-// Util/JsonUtil.cs
 namespace DockerUpdateService.Util;
 
 internal static class JsonUtil

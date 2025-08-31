@@ -1,41 +1,96 @@
 // Options/UpdateOptions.cs
+using Cronos;
+
 namespace DockerUpdateService.Options;
 
 public sealed class UpdateOptions
 {
-    public string Mode { get; init; } = "INTERVAL";  // INTERVAL | DAILY | WEEKLY | MONTHLY
-    public string? Interval { get; init; } = "10m";  // e.g. 10m, 30s, 1h
-    public string TimeOfDay { get; init; } = "03:00"; // HH:mm
-    public string Day { get; init; } = "1";           // 'Monday' for weekly or '1..28' monthly
+    public string Mode { get; set; } = "INTERVAL"; // INTERVAL | DAILY | WEEKLY | MONTHLY | CRON
+    public string? Interval { get; set; } = "10m"; // e.g. 10s, 5m, 3h
+    public string TimeOfDay { get; set; } = "03:00"; // for DAILY/WEEKLY/MONTHLY
+    public string Day { get; set; } = "Sunday"; // for WEEKLY or a number (1..28) for MONTHLY
+    public string? Cron { get; set; } // for CRON mode
 
-    public HashSet<string> ExcludeImages { get; init; } = new(StringComparer.OrdinalIgnoreCase);
-
-    public int BackupRetentionDays { get; set; } = 5;
-    public int ContainerCheckSeconds { get; set; } = 10;
+    public HashSet<string> ExcludeImages { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+    public int ContainerCheckSeconds { get; set; } = 60;
+    public int BackupRetentionDays { get; set; } = 14;
 
     public static UpdateOptions LoadFromEnvironment()
     {
-        var o = new UpdateOptions
-        {
-            Mode = (Environment.GetEnvironmentVariable("UPDATE_MODE") ?? "INTERVAL").Trim().ToUpperInvariant(),
-            Interval = Environment.GetEnvironmentVariable("UPDATE_INTERVAL") ?? "10m",
-            TimeOfDay = Environment.GetEnvironmentVariable("UPDATE_TIME") ?? "03:00",
-            Day = Environment.GetEnvironmentVariable("UPDATE_DAY") ?? "1"
-        };
+        var o = new UpdateOptions();
 
-        var exclude = Environment.GetEnvironmentVariable("EXCLUDE_IMAGES");
-        if (!string.IsNullOrWhiteSpace(exclude))
+        var schedule = Env("SCHEDULE"); // smart single string
+        var mode = Env("SCHEDULE_MODE")?.ToUpperInvariant();
+        var interval = Env("SCHEDULE_INTERVAL");
+        var time = Env("SCHEDULE_TIME");
+        var day = Env("SCHEDULE_DAY");
+        var cron = Env("SCHEDULE_CRON");
+
+        // Friendly SCHEDULE grammar
+        if (!string.IsNullOrWhiteSpace(schedule))
         {
-            foreach (var s in exclude.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries))
-                o.ExcludeImages.Add(s);
+            var s = schedule!.Trim();
+            if (s.StartsWith("cron:", StringComparison.OrdinalIgnoreCase))
+            {
+                mode = "CRON"; cron = s[5..].Trim();
+            }
+            else if (s.StartsWith("daily@", StringComparison.OrdinalIgnoreCase))
+            {
+                mode = "DAILY"; time = s[6..];
+            }
+            else if (s.StartsWith("weekly:", StringComparison.OrdinalIgnoreCase))
+            {
+                mode = "WEEKLY";
+                var rest = s[7..];
+                var parts = rest.Split('@', 2, StringSplitOptions.TrimEntries);
+                day = parts[0];
+                time = parts.Length > 1 ? parts[1] : "03:00";
+            }
+            else if (s.StartsWith("monthly:", StringComparison.OrdinalIgnoreCase))
+            {
+                mode = "MONTHLY";
+                var rest = s[8..];
+                var parts = rest.Split('@', 2, StringSplitOptions.TrimEntries);
+                day = parts[0];
+                time = parts.Length > 1 ? parts[1] : "03:00";
+            }
+            else
+            {
+                mode = "INTERVAL"; interval = s;
+            }
         }
 
-        if (int.TryParse(Environment.GetEnvironmentVariable("BACKUP_RETENTION_DAYS"), out var d) && d > 0)
-            o.BackupRetentionDays = d;
+        o.Mode = mode ?? o.Mode;
+        o.Interval = interval ?? o.Interval;
+        o.TimeOfDay = time ?? o.TimeOfDay;
+        o.Day = day ?? o.Day;
+        o.Cron = cron;
 
-        if (int.TryParse(Environment.GetEnvironmentVariable("CONTAINER_CHECK_SECONDS"), out var cs) && cs > 0)
-            o.ContainerCheckSeconds = cs;
+        // Exclusion list (images or containers)
+        var excl = Env("EXCLUDE") ?? Env("EXCLUDE_IMAGES") ?? "";
+        var exclFile = Env("EXCLUDE_FILE");
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        void AddSplit(string? csv)
+        {
+            if (string.IsNullOrWhiteSpace(csv)) return;
+            foreach (var p in csv.Split([',', ';', '\n'], StringSplitOptions.RemoveEmptyEntries))
+            {
+                var t = p.Trim();
+                if (!string.IsNullOrWhiteSpace(t)) set.Add(t);
+            }
+        }
+        AddSplit(excl);
+        if (!string.IsNullOrWhiteSpace(exclFile) && File.Exists(exclFile))
+            AddSplit(File.ReadAllText(exclFile));
+
+        o.ExcludeImages = set;
+
+        o.ContainerCheckSeconds = EnvInt("CONTAINER_CHECK_SECONDS") ?? o.ContainerCheckSeconds;
+        o.BackupRetentionDays = EnvInt("BACKUP_RETENTION_DAYS") ?? o.BackupRetentionDays;
 
         return o;
     }
+
+    private static string? Env(string name) => Environment.GetEnvironmentVariable(name);
+    private static int? EnvInt(string name) => int.TryParse(Env(name), out var v) ? v : null;
 }

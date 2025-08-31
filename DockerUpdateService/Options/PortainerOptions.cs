@@ -1,22 +1,27 @@
-// Options/PortainerOptions.cs
 namespace DockerUpdateService.Options;
 
 public sealed class PortainerOptions
 {
+    public bool Enabled { get; init; }
     public string? Url { get; init; }
-    public string? ApiKey { get; init; }
-    public bool InsecureTls { get; init; } = true;
-
-    public bool Enabled => !string.IsNullOrWhiteSpace(Url) && !string.IsNullOrWhiteSpace(ApiKey);
+    public string? ApiKey { get; init; } // X-API-Key
+    public string? Username { get; init; }
+    public string? Password { get; init; }
+    public bool InsecureTls { get; init; }
 
     public static PortainerOptions LoadFromEnvironment()
     {
         return new PortainerOptions
         {
-            Url = Environment.GetEnvironmentVariable("PORTAINER_URL"),
+            Enabled = EnvBool("PORTAINER_ENABLED") ?? !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("PORTAINER_URL")),
+            Url = Environment.GetEnvironmentVariable("PORTAINER_URL")?.TrimEnd('/'),
             ApiKey = Environment.GetEnvironmentVariable("PORTAINER_API_KEY"),
-            InsecureTls = (Environment.GetEnvironmentVariable("PORTAINER_INSECURE") ?? "true")
-                .Equals("true", StringComparison.OrdinalIgnoreCase)
+            Username = Environment.GetEnvironmentVariable("PORTAINER_USERNAME"),
+            Password = Environment.GetEnvironmentVariable("PORTAINER_PASSWORD"),
+            InsecureTls = EnvBool("PORTAINER_INSECURE_TLS") ?? false
         };
     }
+
+    private static bool? EnvBool(string name)
+        => bool.TryParse(Environment.GetEnvironmentVariable(name), out var v) ? v : null;
 }

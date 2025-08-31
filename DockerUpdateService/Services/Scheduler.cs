@@ -1,4 +1,4 @@
-// Services/Scheduler.cs
+using Cronos;
 using DockerUpdateService.Options;
 
 namespace DockerUpdateService.Services;
@@ -8,18 +8,20 @@ internal static class Scheduler
     public static TimeSpan NextDelay(UpdateOptions o, DateTime? nowOverride = null)
     {
         var now = nowOverride ?? DateTime.Now;
-        return o.Mode switch
+
+        return o.Mode?.ToUpperInvariant() switch
         {
-            "DAILY"   => UntilNextDaily(o.TimeOfDay, now),
-            "WEEKLY"  => UntilNextWeekly(o.Day, o.TimeOfDay, now),
+            "DAILY" => UntilNextDaily(o.TimeOfDay, now),
+            "WEEKLY" => UntilNextWeekly(o.Day, o.TimeOfDay, now),
             "MONTHLY" => UntilNextMonthly(o.Day, o.TimeOfDay, now),
-            _         => ParseInterval(o.Interval ?? "10m")
+            "CRON" => NextCron(o.Cron, now),
+            _ => ParseInterval(o.Interval ?? "10m")
         };
     }
 
     private static TimeSpan ParseInterval(string s)
     {
-        if (s.Length < 2) return TimeSpan.FromMinutes(10);
+        if (string.IsNullOrWhiteSpace(s) || s.Length < 2) return TimeSpan.FromMinutes(10);
         var suffix = s[^1];
         if (!int.TryParse(s[..^1], out int n)) return TimeSpan.FromMinutes(10);
         return suffix switch
@@ -67,5 +69,15 @@ internal static class Scheduler
         var target = new DateTime(now.Year, now.Month, d, h, m, 0);
         if (now >= target) target = target.AddMonths(1);
         return target - now;
+    }
+
+    private static TimeSpan NextCron(string? expr, DateTime now)
+    {
+        if (string.IsNullOrWhiteSpace(expr))
+            return TimeSpan.FromMinutes(10);
+        var cron = CronExpression.Parse(expr, CronFormat.Standard);
+        var next = cron.GetNextOccurrence(now, TimeZoneInfo.Local, inclusive: false);
+        if (next is null) return TimeSpan.FromMinutes(10);
+        return next.Value - now;
     }
 }

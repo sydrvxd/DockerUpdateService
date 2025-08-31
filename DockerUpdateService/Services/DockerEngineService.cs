@@ -1,4 +1,3 @@
-// Services/DockerEngineService.cs
 using Docker.DotNet;
 using Docker.DotNet.Models;
 using DockerUpdateService.Options;
@@ -52,9 +51,13 @@ public sealed class DockerEngineService
         var (repo, tag) = SplitImage(fullImage);
         try
         {
-            await _docker.Images.CreateImageAsync(new ImagesCreateParameters { FromImage = repo, Tag = tag }, null, new Progress<JSONMessage>());
+            await _docker.Images.CreateImageAsync(
+                new ImagesCreateParameters { FromImage = repo, Tag = tag }, null, new Progress<JSONMessage>());
         }
-        catch { /* ignore pull errors */ }
+        catch
+        {
+            // Pull may fail (auth/rate-limit). Treat as "no new version detected".
+        }
 
         var imgs = await _docker.Images.ListImagesAsync(new ImagesListParameters());
         var newId = imgs.FirstOrDefault(i => i.RepoTags?.Contains($"{repo}:{tag}") == true)?.ID;
@@ -63,14 +66,15 @@ public sealed class DockerEngineService
         return newId is not null && newId != current;
     }
 
-    public async Task CheckAndUpdateContainers(HashSet<string> excludeImages, HashSet<string> ignoredContainers, List<string> stackImages, CancellationToken ct)
+    public async Task CheckAndUpdateContainers(HashSet<string> exclude, HashSet<string> ignoredContainers, List<string> stackImages, CancellationToken ct)
     {
-        _log.LogInformation("Checking containers...");
+        _log.LogInformation("Checking non-stack containers …");
         var containers = await _docker.Containers.ListContainersAsync(new ContainersListParameters { All = true }, ct);
 
         foreach (var ctr in containers)
         {
             ct.ThrowIfCancellationRequested();
+
             var name = ctr.Names.FirstOrDefault()?.TrimStart('/') ?? ctr.ID;
             var details = await _docker.Containers.InspectContainerAsync(ctr.ID, ct);
             var originalRef = details.Config.Image ?? ctr.Image;
@@ -81,13 +85,16 @@ public sealed class DockerEngineService
                 continue;
             }
 
-            if (excludeImages.Any(x => originalRef.Contains(x, StringComparison.OrdinalIgnoreCase) || x.Contains(name, StringComparison.OrdinalIgnoreCase))) continue;
-            if (ignoredContainers.Any(x => originalRef.Contains(x, StringComparison.OrdinalIgnoreCase) || x.Contains(name, StringComparison.OrdinalIgnoreCase))) continue;
-            if (stackImages.Any(x => originalRef.Contains(x, StringComparison.OrdinalIgnoreCase) || x.Contains(name, StringComparison.OrdinalIgnoreCase))) continue;
+            bool matches(HashSet<string> set) => set.Any(x =>
+                originalRef.Contains(x, StringComparison.OrdinalIgnoreCase) || name.Contains(x, StringComparison.OrdinalIgnoreCase));
+
+            if (matches(exclude)) continue;
+            if (matches(ignoredContainers)) continue;
+            if (stackImages.Any(x => originalRef.Contains(x, StringComparison.OrdinalIgnoreCase))) continue;
 
             var (repo, tag) = SplitImage(originalRef);
             var fullTag = $"{repo}:{tag}";
-            _log.LogInformation("  Checking {Name} ({ImageId}) against {FullTag} ...", name, ctr.ImageID, fullTag);
+            _log.LogInformation("  Checking {Name} ({ImageId}) against {FullTag} …", name, ctr.ImageID, fullTag);
 
             await _docker.Images.CreateImageAsync(new ImagesCreateParameters { FromImage = repo, Tag = tag }, null, new Progress<JSONMessage>(), ct);
             var newId = (await _docker.Images.ListImagesAsync(new ImagesListParameters(), ct))
@@ -95,7 +102,7 @@ public sealed class DockerEngineService
 
             if (newId is null || newId == ctr.ImageID) continue;
 
-            _log.LogInformation("Updating container {Name} to new image {FullTag}", name, fullTag);
+            _log.LogInformation("  Updating container {Name} to newer image {FullTag}", name, fullTag);
 
             var backupTag = $"backup-{DateTime.UtcNow:yyyyMMddHHmmss}";
             try
@@ -104,7 +111,7 @@ public sealed class DockerEngineService
             }
             catch (Exception ex)
             {
-                _log.LogWarning(ex, "Backup failed for {Name}", name);
+                _log.LogWarning(ex, "  Backup tag failed for {Name}. Skipping container.", name);
                 continue;
             }
 
@@ -116,27 +123,42 @@ public sealed class DockerEngineService
     {
         var details = await _docker.Containers.InspectContainerAsync(oldId, ct);
 
-        await _docker.Containers.StopContainerAsync(oldId, new ContainerStopParameters(), ct);
-        await _docker.Containers.RemoveContainerAsync(oldId, new ContainerRemoveParameters { Force = true }, ct);
+        // Stop & remove old
+        try { await _docker.Containers.StopContainerAsync(oldId, new ContainerStopParameters(), ct); } catch { }
+        try { await _docker.Containers.RemoveContainerAsync(oldId, new ContainerRemoveParameters { Force = true }, ct); } catch { }
 
+        // Prepare new container with the exact same settings
         var create = new CreateContainerParameters
         {
             Name = details.Name.Trim('/'),
             Image = $"{repo}:{tag}",
             Env = details.Config.Env,
             Cmd = details.Config.Cmd,
+            Entrypoint = details.Config.Entrypoint,
+            User = details.Config.User,
+            WorkingDir = details.Config.WorkingDir,
+            Labels = details.Config.Labels,
             HostConfig = details.HostConfig,
-            NetworkingConfig = new NetworkingConfig { EndpointsConfig = details.NetworkSettings.Networks?.ToDictionary(k => k.Key, v => v.Value) ?? [] }
+            NetworkingConfig = new NetworkingConfig
+            {
+                EndpointsConfig = details.NetworkSettings.Networks?.ToDictionary(k => k.Key, v => v.Value) ?? new Dictionary<string, EndpointSettings>()
+            }
         };
+
         var res = await _docker.Containers.CreateContainerAsync(create, ct);
         await _docker.Containers.StartContainerAsync(res.ID, new ContainerStartParameters(), ct);
 
         var ok = await CheckContainerHealth(name, _opts.ContainerCheckSeconds, ct);
         if (ok) return;
 
-        _log.LogWarning("Rollback {Name} ...", name);
-        await _docker.Containers.StopContainerAsync(res.ID, new ContainerStopParameters(), ct);
-        await _docker.Containers.RemoveContainerAsync(res.ID, new ContainerRemoveParameters { Force = true }, ct);
+        _log.LogWarning("  Health check failed; rolling back {Name} …", name);
+
+        try
+        {
+            await _docker.Containers.StopContainerAsync(res.ID, new ContainerStopParameters(), ct);
+            await _docker.Containers.RemoveContainerAsync(res.ID, new ContainerRemoveParameters { Force = true }, ct);
+        }
+        catch { }
 
         var roll = new CreateContainerParameters
         {
@@ -144,6 +166,10 @@ public sealed class DockerEngineService
             Image = $"{repo}:{backupTag}",
             Env = create.Env,
             Cmd = create.Cmd,
+            Entrypoint = create.Entrypoint,
+            User = create.User,
+            WorkingDir = create.WorkingDir,
+            Labels = create.Labels,
             HostConfig = create.HostConfig,
             NetworkingConfig = create.NetworkingConfig
         };
@@ -170,69 +196,55 @@ public sealed class DockerEngineService
         return true;
     }
 
-    public async Task RemoveOldBackupsAndUnusedImages(CancellationToken ct)
+    public async Task PruneUnusedImages(HashSet<string> exclude, CancellationToken ct)
     {
-        _log.LogInformation("Pruning backup images and unused tags …");
+        _log.LogInformation("Pruning unused images (excluding substrings: {Ex}) …", string.Join(", ", exclude));
 
-        var now = DateTime.UtcNow;
-        var usedImageIds = new HashSet<string>();
-
+        // Collect used image IDs
+        var usedImageIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var containers = await _docker.Containers.ListContainersAsync(new ContainersListParameters { All = true }, ct);
         foreach (var c in containers)
             usedImageIds.Add(c.ImageID);
 
-        var allImages = await _docker.Images.ListImagesAsync(new ImagesListParameters { All = true }, ct);
+        var images = await _docker.Images.ListImagesAsync(new ImagesListParameters { All = true }, ct);
 
-        var imagesByRepo = allImages
-            .SelectMany(img => img.RepoDigests ?? [], (img, name) => new { img, name })
-            .GroupBy(x => string.Join(", ", x.name).Split("@", StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)[0])
-            .ToDictionary(g => g.Key, g => g.Select(x => (x.img, x.name)).ToList());
-
-        foreach (var kv in imagesByRepo)
+        foreach (var img in images)
         {
-            var repo = kv.Key;
-            var list = kv.Value;
-            var repoInUse = list.Any(x => usedImageIds.Contains(x.img.ID));
+            if (usedImageIds.Contains(img.ID)) continue;
 
-            if (!repoInUse) continue;
-            else _log.LogInformation("  Found {Count} tags for {Repo} (used: {RepoInUse})", list.Count, repo, repoInUse);
+            var tags = img.RepoTags ?? new List<string>();
 
-            foreach (var tuple in list)
+            // Keep excluded tags
+            if (tags.Any(t => exclude.Any(ex => t.Contains(ex, StringComparison.OrdinalIgnoreCase))))
+                continue;
+
+            // Keep recent backups
+            var isBackup = false; var tooOld = false;
+            foreach (var t in tags)
             {
-                var img = tuple.img;
-                var tag = tuple.name;
-
-                var tagInUse = usedImageIds.Contains(img.ID);
-                var m = Patterns.BackupRegex().Match(tag);
-                var isBackupTag = m.Success;
-                var backupTooOld = false;
-
-                if (isBackupTag)
+                var m = Patterns.BackupRegex().Match(t);
+                if (m.Success)
                 {
-                    var ts = m.Groups["stamp"].Value;
-                    if (DateTime.TryParseExact(ts, "yyyyMMddHHmmss", System.Globalization.CultureInfo.InvariantCulture,
-                                               System.Globalization.DateTimeStyles.None, out var t))
+                    isBackup = true;
+                    if (DateTime.TryParseExact(m.Groups["stamp"].Value, "yyyyMMddHHmmss",
+                        System.Globalization.CultureInfo.InvariantCulture,
+                        System.Globalization.DateTimeStyles.None, out var ts))
                     {
-                        backupTooOld = now - t > TimeSpan.FromDays(_opts.BackupRetentionDays);
+                        tooOld = (DateTime.UtcNow - ts) > TimeSpan.FromDays(_opts.BackupRetentionDays);
                     }
-                    else
-                    {
-                        backupTooOld = true;
-                    }
+                    else tooOld = true;
                 }
+            }
+            if (isBackup && !tooOld) continue;
 
-                if (!tagInUse && (!isBackupTag || backupTooOld))
-                {
-                    try
-                    {
-                        _log.LogInformation("  Removing unused image {Tag}", tag);
-                        await _docker.Images.DeleteImageAsync(tag, new ImageDeleteParameters { Force = true }, ct);
-                    }
-                    catch (Exception ex)
-                    {
-                        _log.LogWarning(ex, "  Failed to delete {Tag}", tag);
-                    }
-                }
+            try
+            {
+                _log.LogInformation("  Deleting image {Id} ({Tags})", img.ID, string.Join(", ", tags));
+                await _docker.Images.DeleteImageAsync(img.ID, new ImageDeleteParameters { Force = true }, ct);
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "  Failed to delete image {Id}", img.ID);
             }
         }
     }

@@ -1,4 +1,3 @@
-// Util/Patterns.cs
 namespace DockerUpdateService.Util;
 
 internal static partial class Patterns

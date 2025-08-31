@@ -8,15 +8,16 @@ using Microsoft.Extensions.Logging;
 
 var builder = Host.CreateApplicationBuilder(args);
 
-// Logging (simple console, timestamps)
+// Logging
 builder.Logging.ClearProviders();
 builder.Logging.AddSimpleConsole(o =>
 {
+    o.UseUtcTimestamp = false;
     o.TimestampFormat = "yyyy-MM-dd HH:mm:ss ";
     o.SingleLine = true;
 });
 
-// Options from environment variables
+// Options (from env)
 builder.Services.AddSingleton(UpdateOptions.LoadFromEnvironment());
 builder.Services.AddSingleton(PortainerOptions.LoadFromEnvironment());
 
@@ -30,8 +31,8 @@ builder.Services.AddSingleton<IDockerClient>(sp =>
     {
         not null and not "" => dockerHost,
         _ => OperatingSystem.IsWindows()
-                ? "npipe://./pipe/docker_engine"
-                : (File.Exists("/var/run/docker.sock") ? "unix:///var/run/docker.sock" : null)
+            ? "npipe://./pipe/docker_engine"
+            : (File.Exists("/var/run/docker.sock") ? "unix:///var/run/docker.sock" : null)
     };
 
     if (uri is null)
@@ -47,13 +48,9 @@ builder.Services.AddHttpClient<PortainerService>()
     {
         var opt = sp.GetRequiredService<PortainerOptions>();
         if (!string.IsNullOrWhiteSpace(opt.Url))
-        {
             client.BaseAddress = new Uri(opt.Url!);
-        }
         if (!string.IsNullOrWhiteSpace(opt.ApiKey))
-        {
             client.DefaultRequestHeaders.TryAddWithoutValidation("X-API-Key", opt.ApiKey);
-        }
     })
     .ConfigurePrimaryHttpMessageHandler(sp =>
     {
@@ -65,10 +62,8 @@ builder.Services.AddHttpClient<PortainerService>()
         };
     });
 
-// Core services
+// Services
 builder.Services.AddSingleton<DockerEngineService>();
 builder.Services.AddHostedService<DockerUpdateWorker>();
 
-var app = builder.Build();
-
-await app.RunAsync();
+await builder.Build().RunAsync();

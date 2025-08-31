@@ -1,7 +1,4 @@
-// Services/PortainerService.cs
-using System.Net.Http.Headers;
 using Docker.DotNet;
-using Docker.DotNet.Models;
 using DockerUpdateService.Models;
 using DockerUpdateService.Options;
 using DockerUpdateService.Util;
@@ -10,29 +7,57 @@ using Microsoft.Extensions.Logging;
 namespace DockerUpdateService.Services;
 
 public sealed class PortainerService(
-    HttpClient http, 
-    IDockerClient docker, 
-    DockerEngineService engine, 
-    PortainerOptions opts, 
+    HttpClient http,
+    IDockerClient docker,
+    DockerEngineService engine,
+    PortainerOptions opts,
+    UpdateOptions updateOptions,
     ILogger<PortainerService> log)
 {
     private readonly HttpClient _http = http;
     private readonly IDockerClient _docker = docker;
     private readonly DockerEngineService _engine = engine;
     private readonly PortainerOptions _opts = opts;
+    private readonly UpdateOptions _update = updateOptions;
     private readonly ILogger<PortainerService> _log = log;
 
+    private string? _jwt;
+
     public bool Enabled => _opts.Enabled;
+
+    private async Task EnsureAuthAsync(CancellationToken ct)
+    {
+        if (_http.BaseAddress is null && !string.IsNullOrWhiteSpace(_opts.Url))
+            _http.BaseAddress = new Uri(_opts.Url!);
+
+        if (!string.IsNullOrWhiteSpace(_opts.ApiKey))
+            return; // API key header already set in Program.cs
+
+        if (string.IsNullOrWhiteSpace(_opts.Username) || string.IsNullOrWhiteSpace(_opts.Password))
+            return;
+
+        if (_jwt is not null) return;
+
+        var payload = JsonSerializer.Serialize(new { username = _opts.Username, password = _opts.Password });
+        var resp = await _http.PostAsync("/api/auth", new StringContent(payload, Encoding.UTF8, "application/json"), ct);
+        resp.EnsureSuccessStatusCode();
+        var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync(ct));
+        if (doc.RootElement.TryGetProperty("jwt", out var jwtEl))
+        {
+            _jwt = jwtEl.GetString();
+            if (!string.IsNullOrEmpty(_jwt))
+                _http.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", _jwt);
+        }
+    }
 
     public async Task<(List<string> stackImages, HashSet<string> newlyIgnored)> CheckAndUpdatePortainerStacksAsync(CancellationToken ct)
     {
         var stackImages = new List<string>();
-        var newlyIgnored = new HashSet<string>();
+        var newlyIgnored = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         if (!Enabled) return (stackImages, newlyIgnored);
 
-        if (_http.BaseAddress is null && !string.IsNullOrWhiteSpace(_opts.Url))
-            _http.BaseAddress = new Uri(_opts.Url!);
+        await EnsureAuthAsync(ct);
 
         _log.LogInformation("Querying Portainer stacks …");
         var listResp = await _http.GetAsync("/api/stacks", ct);
@@ -46,59 +71,81 @@ public sealed class PortainerService(
 
         foreach (var stack in stacks)
         {
+            ct.ThrowIfCancellationRequested();
+
+            // Only Docker stacks (1=swarm, 2=compose)
+            if (stack.Type is not (1 or 2))
+            {
+                _log.LogInformation("Skipping non-Docker stack {Id} ({Type})", stack.Id, stack.Type);
+                continue;
+            }
+
             _log.LogInformation("Checking stack '{Name}' (ID {Id}) …", stack.Name, stack.Id);
 
+            // Get YAML
             var fileResp = await _http.GetAsync($"/api/stacks/{stack.Id}/file", ct);
             fileResp.EnsureSuccessStatusCode();
-
             var fileJson = await fileResp.Content.ReadAsStringAsync(ct);
             var yaml = JsonSerializer.Deserialize<StackFileResponse>(fileJson)?.StackFileContent ?? string.Empty;
 
+            // Collect images & decide update
             var images = YamlParse.ParseImages(yaml);
-
             var updateNeeded = false;
+
             foreach (var img in images)
             {
                 var (repo, tag) = DockerEngineService.SplitImage(img);
-                stackImages.Add($"{repo}");
+                var imageKey = $"{repo}";
+                if (!stackImages.Contains(imageKey)) stackImages.Add(imageKey);
+
+                // Apply exclusion
+                if (_update.ExcludeImages.Any(x => repo.Contains(x, StringComparison.OrdinalIgnoreCase) || img.Contains(x, StringComparison.OrdinalIgnoreCase)))
+                {
+                    _log.LogInformation("  Skipping excluded image {Image}", img);
+                    continue;
+                }
+
                 if (await _engine.ImageHasNewVersion(img))
                 {
                     _log.LogInformation("  Update available for {Image}", img);
                     updateNeeded = true;
                 }
             }
+
             if (!updateNeeded)
             {
                 _log.LogInformation("  No updates for this stack.");
                 continue;
             }
 
+            // Fetch env for stack (UI mirrors this)
             var detailResp = await _http.GetAsync($"/api/stacks/{stack.Id}", ct);
             detailResp.EnsureSuccessStatusCode();
-            StackEnv[] env = [];
-            if (detailResp.IsSuccessStatusCode)
+
+            var env = Array.Empty<StackEnv>();
+            try
             {
                 var envJson = await detailResp.Content.ReadAsStringAsync(ct);
                 var proj = JsonSerializer.Deserialize<ComposeProject>(envJson);
                 if (proj?.Env is not null)
-                    env = [.. proj.Env.Select(e => new StackEnv(e.Name, e.Value))];
+                    env = proj.Env.Select(e => new StackEnv(e.Name, e.Value)).ToArray();
             }
+            catch { }
 
-            var detail = await JsonSerializer
-                .DeserializeAsync<PortainerStackWithFile>(await detailResp.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
+            var envArr = env;
 
-            var envArr = env ?? detail?.Env ?? [];
-
+            // Mirror UI redeploy payload
             var payload = new
             {
-                stackFileContent = yaml,
-                env = envArr,
-                prune = true
+                StackFileContent = yaml,
+                Env = envArr,
+                Prune = true
             };
 
             var body = new StringContent(JsonSerializer.Serialize(payload, JsonUtil.CamelCase()), Encoding.UTF8, "application/json");
-            var url = $"/api/stacks/{stack.Id}?endpointId={stack.EndpointId}&method=string&pullImage=true&recreate=always";
+            var url = $"/api/stacks/{stack.Id}?endpointId={stack.EndpointId}&method=string&pullImage=1&recreate=always";
 
+            _log.LogInformation("  Redeploying stack {Name} via Portainer API …", stack.Name);
             var upd = await _http.PutAsync(url, body, ct);
             if (!upd.IsSuccessStatusCode)
             {
@@ -109,6 +156,7 @@ public sealed class PortainerService(
 
             _log.LogInformation("  Stack redeployed successfully.");
 
+            // Ignore compose project containers in the single-container pass
             var related = await _docker.Containers.ListContainersAsync(new ContainersListParameters
             {
                 All = true,
@@ -125,21 +173,15 @@ public sealed class PortainerService(
             {
                 var cname = ctr.Names.FirstOrDefault()?.TrimStart('/');
                 if (cname is not null && newlyIgnored.Add(cname))
-                    _log.LogInformation("    Container {Name} will be ignored in future single-container checks.", cname);
+                    _log.LogInformation("    Container {Name} will be ignored in single-container checks.", cname);
             }
         }
 
         return (stackImages, newlyIgnored);
     }
 
-    // Helper DTOs
-    private sealed record PortainerStack(int Id, string Name, int EndpointId);
+    // DTOs
+    private sealed record PortainerStack(int Id, string Name, int EndpointId, int Type);
     private sealed record StackEnv(string Name, string? Value);
     private sealed record StackFileResponse(string StackFileContent);
-    private sealed record PortainerStackWithFile(
-        int Id,
-        string Name,
-        int EndpointId,
-        string StackFileContent,
-        StackEnv[]? Env);
 }
