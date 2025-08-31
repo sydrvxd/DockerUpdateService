@@ -1,3 +1,4 @@
+// Services/PortainerService.cs
 using Docker.DotNet;
 using DockerUpdateService.Models;
 using DockerUpdateService.Options;
@@ -31,7 +32,7 @@ public sealed class PortainerService(
             _http.BaseAddress = new Uri(_opts.Url!);
 
         if (!string.IsNullOrWhiteSpace(_opts.ApiKey))
-            return; // API key header already set in Program.cs
+            return;
 
         if (string.IsNullOrWhiteSpace(_opts.Username) || string.IsNullOrWhiteSpace(_opts.Password))
             return;
@@ -83,25 +84,61 @@ public sealed class PortainerService(
             _log.LogInformation("Checking stack '{Name}' (ID {Id}) …", stack.Name, stack.Id);
 
             // Get YAML
+            // 1) Get compose YAML for redeploy payload (unchanged)
             var fileResp = await _http.GetAsync($"/api/stacks/{stack.Id}/file", ct);
             fileResp.EnsureSuccessStatusCode();
             var fileJson = await fileResp.Content.ReadAsStringAsync(ct);
             var yaml = JsonSerializer.Deserialize<StackFileResponse>(fileJson)?.StackFileContent ?? string.Empty;
 
-            // Collect images & decide update
-            var images = YamlParse.ParseImages(yaml);
-            var updateNeeded = false;
-
-            foreach (var img in images)
+            // 2) Ask Docker which containers belong to this stack (most reliable)
+            var related = await _docker.Containers.ListContainersAsync(new ContainersListParameters
             {
+                All = true,
+                Filters = new Dictionary<string, IDictionary<string, bool>>
+                {
+                    ["label"] = new Dictionary<string, bool>
+                    {
+                        [$"com.docker.compose.project={stack.Name}"] = true
+                    }
+                }
+            }, ct);
+
+            // Build a unique list of image refs actually used by the stack
+            var imagesInStack = related
+                .Select(c => c.Image) // repo:tag (not ID)
+                .Where(s => !string.IsNullOrWhiteSpace(s))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            if (imagesInStack.Count == 0)
+            {
+                _log.LogInformation("  No containers found for stack {Name}; skipping.", stack.Name);
+                continue;
+            }
+
+            _log.LogInformation("  Images in stack {Name}: {Images}", stack.Name, string.Join(", ", imagesInStack));
+
+            bool updateNeeded = false;
+
+            foreach (var img in imagesInStack)
+            {
+                // Skip digest-pinned images (immutable)
+                if (img.Contains("@sha256:", StringComparison.OrdinalIgnoreCase))
+                {
+                    _log.LogInformation("  {Image} is digest-pinned; skipping update check.", img);
+                    continue;
+                }
+
                 var (repo, tag) = DockerEngineService.SplitImage(img);
-                var imageKey = $"{repo}";
+                var imageKey = repo; // used to ignore single-container updates later
                 if (!stackImages.Contains(imageKey)) stackImages.Add(imageKey);
 
-                // Apply exclusion
-                if (_update.ExcludeImages.Any(x => repo.Contains(x, StringComparison.OrdinalIgnoreCase) || img.Contains(x, StringComparison.OrdinalIgnoreCase)))
+                // Apply exclusion list (both image & container names are substrings)
+                if (_update.ExcludeImages.Any(x =>
+                    repo.Contains(x, StringComparison.OrdinalIgnoreCase) ||
+                    img.Contains(x, StringComparison.OrdinalIgnoreCase)))
                 {
-                    _log.LogInformation("  Skipping excluded image {Image}", img);
+                    _log.LogInformation("  Excluded: {Image}", img);
                     continue;
                 }
 
@@ -111,6 +148,7 @@ public sealed class PortainerService(
                     updateNeeded = true;
                 }
             }
+
 
             if (!updateNeeded)
             {
@@ -132,13 +170,10 @@ public sealed class PortainerService(
             }
             catch { }
 
-            var envArr = env;
-
-            // Mirror UI redeploy payload
             var payload = new
             {
                 StackFileContent = yaml,
-                Env = envArr,
+                Env = env,
                 Prune = true
             };
 
