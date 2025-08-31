@@ -90,7 +90,8 @@ public sealed class PortainerService(
             var fileJson = await fileResp.Content.ReadAsStringAsync(ct);
             var yaml = JsonSerializer.Deserialize<StackFileResponse>(fileJson)?.StackFileContent ?? string.Empty;
 
-            // 2) Ask Docker which containers belong to this stack (most reliable)
+            // 2) Ask Docker which containers belong to this stack
+            // Ask Docker which containers belong to this stack
             var related = await _docker.Containers.ListContainersAsync(new ContainersListParameters
             {
                 All = true,
@@ -103,12 +104,15 @@ public sealed class PortainerService(
                 }
             }, ct);
 
-            // Build a unique list of image refs actually used by the stack
-            var imagesInStack = related
-                .Select(c => c.Image) // repo:tag (not ID)
-                .Where(s => !string.IsNullOrWhiteSpace(s))
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .ToList();
+            // Build a unique set of *original* image refs (repo[:tag]) from container config
+            var imagesInStack = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var c in related)
+            {
+                var details = await _docker.Containers.InspectContainerAsync(c.ID, ct);
+                var imageRef = details.Config?.Image ?? c.Image;
+                if (!string.IsNullOrWhiteSpace(imageRef))
+                    imagesInStack.Add(imageRef);
+            }
 
             if (imagesInStack.Count == 0)
             {
@@ -123,17 +127,19 @@ public sealed class PortainerService(
             foreach (var img in imagesInStack)
             {
                 // Skip digest-pinned images (immutable)
-                if (img.Contains("@sha256:", StringComparison.OrdinalIgnoreCase))
+                if (img.StartsWith("sha256:", StringComparison.OrdinalIgnoreCase) ||
+                    img.Contains("@sha256:", StringComparison.OrdinalIgnoreCase))
                 {
                     _log.LogInformation("  {Image} is digest-pinned; skipping update check.", img);
                     continue;
                 }
 
                 var (repo, tag) = DockerEngineService.SplitImage(img);
-                var imageKey = repo; // used to ignore single-container updates later
-                if (!stackImages.Contains(imageKey)) stackImages.Add(imageKey);
+                _log.LogInformation("    Checking image {Image} => repo={Repo} tag={Tag}", img, repo, tag);
 
-                // Apply exclusion list (both image & container names are substrings)
+                if (!stackImages.Contains(repo)) stackImages.Add(repo); // ignore single-container pass for this repo
+
+                // Exclusions
                 if (_update.ExcludeImages.Any(x =>
                     repo.Contains(x, StringComparison.OrdinalIgnoreCase) ||
                     img.Contains(x, StringComparison.OrdinalIgnoreCase)))
@@ -142,10 +148,12 @@ public sealed class PortainerService(
                     continue;
                 }
 
-                if (await _engine.ImageHasNewVersion(img))
+                if (await _engine.ImageHasNewVersion($"{repo}:{tag}"))
                 {
                     _log.LogInformation("  Update available for {Image}", img);
+                    _log.LogInformation("  Stop the image check becaus an update is needed anyways.");
                     updateNeeded = true;
+                    break;
                 }
             }
 

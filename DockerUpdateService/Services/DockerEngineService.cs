@@ -6,18 +6,11 @@ using Microsoft.Extensions.Logging;
 
 namespace DockerUpdateService.Services;
 
-public sealed class DockerEngineService
+public sealed class DockerEngineService(IDockerClient docker, UpdateOptions opts, ILogger<DockerEngineService> log)
 {
-    private readonly IDockerClient _docker;
-    private readonly UpdateOptions _opts;
-    private readonly ILogger<DockerEngineService> _log;
-
-    public DockerEngineService(IDockerClient docker, UpdateOptions opts, ILogger<DockerEngineService> log)
-    {
-        _docker = docker;
-        _opts = opts;
-        _log = log;
-    }
+    private readonly IDockerClient _docker = docker;
+    private readonly UpdateOptions _opts = opts;
+    private readonly ILogger<DockerEngineService> _log = log;
 
     public static (string repo, string tag) SplitImage(string reference)
     {
@@ -49,22 +42,206 @@ public sealed class DockerEngineService
     public async Task<bool> ImageHasNewVersion(string fullImage)
     {
         var (repo, tag) = SplitImage(fullImage);
+        var imageKey = $"{repo}:{tag}";
+        var candidates = CanonicalTagCandidates(repo, tag);
+
+        // BEFORE pull
+        var (oldId, oldDigests) = await InspectLocal(candidates);
+        var oldDigest = FirstDigestForRepo(oldDigests, repo);
+
+        // Pull with progress – record if daemon reports a newer download
+        bool pulledNewer = false;
+        var progress = new Progress<JSONMessage>(m =>
+        {
+            var s = m.Status?.ToLowerInvariant();
+            if (s is null) return;
+            if (s.Contains("downloaded newer image") || s.Contains("pulling fs layer") ||
+                s.Contains("downloading") || s.Contains("extracting"))
+            {
+                pulledNewer = true;
+            }
+        });
+
         try
         {
             await _docker.Images.CreateImageAsync(
-                new ImagesCreateParameters { FromImage = repo, Tag = tag }, null, new Progress<JSONMessage>());
+                new ImagesCreateParameters { FromImage = repo, Tag = tag },
+                authConfig: null,
+                progress: progress);
         }
-        catch
+        catch (Exception ex)
         {
-            // Pull may fail (auth/rate-limit). Treat as "no new version detected".
+            _log.LogDebug(ex, "Pull error for {Image}", imageKey);
+            // keep going; we'll compare whatever we can
         }
 
-        var imgs = await _docker.Images.ListImagesAsync(new ImagesListParameters());
-        var newId = imgs.FirstOrDefault(i => i.RepoTags?.Contains($"{repo}:{tag}") == true)?.ID;
+        // AFTER pull
+        var (newId, newDigests) = await InspectLocal(candidates);
+        var newDigest = FirstDigestForRepo(newDigests, repo);
 
-        var current = await CurrentImageId(fullImage);
-        return newId is not null && newId != current;
+        _log.LogInformation("    Compare {Image}: ID {OldId} -> {NewId} ; Digest {OldDig} -> {NewDig}",
+            imageKey, oldId, newId, oldDigest, newDigest);
+
+        // No local image before but present after => treat as update available
+        if (oldId is null && newId is not null) return true;
+
+        // Primary signal: ID changed
+        if (!string.Equals(oldId, newId, StringComparison.OrdinalIgnoreCase)) return true;
+
+        // Secondary: digest changed
+        if (!string.Equals(oldDigest, newDigest, StringComparison.OrdinalIgnoreCase)) return true;
+
+        // Fallback: progress said we pulled something newer (rare ID race)
+        return pulledNewer;
     }
+
+    /// <summary>
+    /// Try to resolve the local image by several canonical names and return (Id, RepoDigests).
+    /// Works across Docker.DotNet versions without referencing specific response types.
+    /// </summary>
+    private async Task<(string? Id, IList<string>? RepoDigests)> InspectLocal(HashSet<string> candidates)
+    {
+        // 1) Try Inspect by name for each candidate
+        foreach (var cand in candidates)
+        {
+            try
+            {
+                // The exact return type differs by package version; use 'var' and read properties dynamically.
+                var info = await _docker.Images.InspectImageAsync(cand);
+                if (info is not null)
+                {
+                    // both properties exist across versions
+                    var id = (string?)info.GetType().GetProperty("ID")?.GetValue(info);
+                    var digests = (IList<string>?)info.GetType().GetProperty("RepoDigests")?.GetValue(info);
+                    if (!string.IsNullOrEmpty(id)) return (id, digests);
+                }
+            }
+            catch
+            {
+                // 404 etc. – try next candidate
+                _log.LogDebug("    Inspect failed for candidate {Cand}", cand);
+            }
+        }
+
+        // 2) Fallback: scan RepoTags, then Inspect by ID to get digests
+        var imgs = await _docker.Images.ListImagesAsync(new ImagesListParameters { All = true });
+        foreach (var cand in candidates)
+        {
+            var id = imgs.FirstOrDefault(i => i.RepoTags?.Contains(cand) == true)?.ID;
+            if (!string.IsNullOrEmpty(id))
+            {
+                try
+                {
+                    var info = await _docker.Images.InspectImageAsync(id);
+                    var digests = (IList<string>?)info.GetType().GetProperty("RepoDigests")?.GetValue(info);
+                    return (id, digests);
+                }
+                catch
+                {
+                    return (id, null);
+                }
+            }
+        }
+        return (null, null);
+    }
+
+    private static string? FirstDigestForRepo(IList<string>? repoDigests, string repo)
+    {
+        if (repoDigests is null) return null;
+
+        // Exact match first (registry present)
+        var hit = repoDigests.FirstOrDefault(d => d.StartsWith(repo + "@sha256:", StringComparison.OrdinalIgnoreCase));
+        if (!string.IsNullOrEmpty(hit)) return hit;
+
+        // Docker Hub canonical alternatives
+        var alts = new List<string>();
+        var firstSeg = repo.Split('/')[0];
+        var hasRegistry = firstSeg.Contains('.') || firstSeg.Contains(':') || string.Equals(firstSeg, "localhost", StringComparison.OrdinalIgnoreCase);
+
+        if (!hasRegistry)
+        {
+            if (!repo.Contains('/'))
+            {
+                alts.Add("docker.io/library/" + repo);
+                alts.Add("index.docker.io/library/" + repo);
+            }
+            else
+            {
+                alts.Add("docker.io/" + repo);
+                alts.Add("index.docker.io/" + repo);
+            }
+        }
+
+        foreach (var alt in alts)
+        {
+            hit = repoDigests.FirstOrDefault(d => d.StartsWith(alt + "@sha256:", StringComparison.OrdinalIgnoreCase));
+            if (!string.IsNullOrEmpty(hit)) return hit;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Return common canonical names the daemon may use for the same logical tag.
+    /// </summary>
+    private static HashSet<string> CanonicalTagCandidates(string repo, string tag)
+    {
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        $"{repo}:{tag}"
+    };
+
+        var firstSeg = repo.Split('/')[0];
+        var hasRegistry = firstSeg.Contains('.') || firstSeg.Contains(':') || string.Equals(firstSeg, "localhost", StringComparison.OrdinalIgnoreCase);
+
+        if (!hasRegistry)
+        {
+            if (!repo.Contains('/'))
+            {
+                set.Add($"library/{repo}:{tag}");
+                set.Add($"docker.io/library/{repo}:{tag}");
+                set.Add($"index.docker.io/library/{repo}:{tag}");
+            }
+            else
+            {
+                set.Add($"docker.io/{repo}:{tag}");
+                set.Add($"index.docker.io/{repo}:{tag}");
+            }
+        }
+        return set;
+    }
+
+    /// <summary>
+    /// Try to find the local image ID using multiple candidate names.
+    /// Uses Inspect first (more exact), then falls back to scanning RepoTags.
+    /// </summary>
+    private async Task<string?> FindLocalImageId(HashSet<string> candidates)
+    {
+        // 1) Try inspect by name for each candidate
+        foreach (var cand in candidates)
+        {
+            try
+            {
+                var info = await _docker.Images.InspectImageAsync(cand);
+                _log.LogInformation("    Inspect found ID {Id} for candidate {Cand}", info.ID, cand);
+                if (!string.IsNullOrEmpty(info?.ID)) return info.ID;
+            }
+            catch
+            {
+                _log.LogInformation("    Inspect failed for candidate {Cand}", cand);
+                // 404 or other: try next candidate
+            }
+        }
+
+        // 2) Fallback: scan RepoTags
+        var imgs = await _docker.Images.ListImagesAsync(new ImagesListParameters { All = true });
+        foreach (var cand in candidates)
+        {
+            var id = imgs.FirstOrDefault(i => i.RepoTags?.Contains(cand) == true)?.ID;
+            if (!string.IsNullOrEmpty(id)) return id;
+        }
+        return null;
+    }
+
 
     public async Task CheckAndUpdateContainers(HashSet<string> exclude, HashSet<string> ignoredContainers, List<string> stackImages, CancellationToken ct)
     {
